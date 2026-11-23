@@ -78,9 +78,20 @@ local RS = game:GetService("ReplicatedStorage")
 local WS = game:GetService("Workspace")
 local LP = Players.LocalPlayer
 
--- [handoff] merged macro pool, Volcano Fortress. Server-accepted positions per type (X, 0.40, Z). Void 12, Minigun 9, Prism 10.
+local KUBLEE_VOID_SPOTS = 6 -- [Build 4] how many leading Void spots are the Kublee555 priority order (kept in order, never shuffled; the rest are shuffled as before)
+-- [Build 4 — Kublee555] Winning macro Kublee555 (Volcano Fortress, high winrate,
+-- 54 actions, all Void, 6 Voids each maxed to L9 in turn): T1 wave 1, T2 wave 3,
+-- no 3rd Void until both are L9 (T2 L9 wave 23, T1 L9 wave 31), then T3 wave 34,
+-- T4 wave 40, T5 wave 48, T6 wave 53. The first 6 Void spots below are exactly
+-- the Kublee555 place coordinates, in that order; the original 12 follow
+-- unchanged (nothing deleted). A "too close" rejection never deletes a spot
+-- permanently: anchors are only treated as full temporarily (ANCHOR_FULL_TTL).
+-- [handoff] merged macro pool, Volcano Fortress. Server-accepted positions per type (X, 0.40, Z). Void 18 (first 6 = Kublee555), Minigun 9, Prism 10.
 local SPOTS_BY_TYPE = {
     Void = {
+        Vector3.new(317.8370666503906, 0.40, 1354.7440185546876), Vector3.new(318.8180236816406, 0.40, 1390.2481689453126),
+        Vector3.new(319.2024841308594, 0.40, 1370.7711181640626), Vector3.new(321.0757751464844, 0.40, 1380.5997314453126),
+        Vector3.new(308.6574401855469, 0.40, 1402.2218017578126), Vector3.new(292.0282287597656, 0.40, 1400.0897216796876),
         Vector3.new(317.22, 0.40, 1374.32), Vector3.new(317.74, 0.40, 1382.82), Vector3.new(317.84, 0.40, 1391.25),
         Vector3.new(317.54, 0.40, 1369.91), Vector3.new(317.25, 0.40, 1377.32), Vector3.new(313.56, 0.40, 1384.44),
         Vector3.new(314.54, 0.40, 1359.23), Vector3.new(326.26, 0.40, 1365.27), Vector3.new(311.86, 0.40, 1374.41),
@@ -107,7 +118,7 @@ local DEFAULTS = {
     TYPE_PRIORITY = { "Prism", "Titan", "Void", "Minigun" }, -- [handoff] rotation order
     BASE_TYPES = { "Void", "Minigun" },   -- always eligible; every other priority type is gated
     GATE_MIN_PLACED = 4,                  -- gated types (Prism/Titan) start once Void OR Minigun has this many placed
-    FIRST_TURN = { "P", "P", "U", "P", "U" }, -- P = place, U = upgrade the lowest-level dragon of the type (first placed wins ties); used when the type owns none
+    FIRST_TURN = { "P", "P", "U", "P", "U" }, -- P = place, U = upgrade the lowest-level dragon of the type (first placed wins ties); used when the type owns none. [Build 4 — Kublee555] the 3rd+ Void "P" is gated by kubleeVoidPlaceOpen (first 2 Voids L9 first); a gated step is skipped and the scheduler upgrades instead.
     NEXT_TURN = { "U", "P", "U" },        -- every later turn
     PLACE_FAIL_UPGRADE_FIRST = 2,         -- after this many consecutive rejected places of a type, each one is followed by an upgrade first
     PLACE_STEP_GIVEUP = 6,                -- rejected places on one turn step before that step is skipped
@@ -233,7 +244,23 @@ local function createEngine(userCfg, ctx)
 
     local function resetRound()
         typedSpots = {}
-        for name, list in pairs(SPOTS_BY_TYPE) do typedSpots[name] = shuffled(list) end
+        for name, list in pairs(SPOTS_BY_TYPE) do
+            -- [Build 4 — Kublee555] resetRound shuffles spots, which would lose
+            -- the Kublee555 priority order. Keep the first KUBLEE_VOID_SPOTS Void
+            -- spots in order (T1..T6) and shuffle only the spots after them.
+            if name == "Void" and #list > KUBLEE_VOID_SPOTS then
+                local head, tail = {}, {}
+                for i = 1, KUBLEE_VOID_SPOTS do head[i] = list[i] end
+                for i = KUBLEE_VOID_SPOTS + 1, #list do tail[#tail + 1] = list[i] end
+                tail = shuffled(tail)
+                local merged = {}
+                for i = 1, KUBLEE_VOID_SPOTS do merged[i] = head[i] end
+                for i = 1, #tail do merged[KUBLEE_VOID_SPOTS + i] = tail[i] end
+                typedSpots[name] = merged
+            else
+                typedSpots[name] = shuffled(list)
+            end
+        end
         failedSpots, typeFails, typeOff, placeCount, placedLog, upgradeCooldown, anchorState = {}, {}, {}, {}, {}, {}, {}
         typeCap, typeOffCount = {}, {}
         turn, cursor, turnsDone = nil, 0, {}
@@ -922,6 +949,44 @@ local function createEngine(userCfg, ctx)
         return false
     end
 
+    -- [Build 4 — Kublee555] Sequential-max gate for Void, from winning macro
+    -- Kublee555 (Volcano Fortress, 54 actions, all Void, 6 Voids each maxed to
+    -- L9 in turn: T1 wave 1, T2 wave 3, no 3rd Void until both are L9 — T2 L9
+    -- wave 23, T1 L9 wave 31 — then T3 wave 34, T4 wave 40, T5 wave 48,
+    -- T6 wave 53). The losing run did the opposite: 6 Voids + 3 Miniguns
+    -- placed by wave 18, only L2 by wave 14, first L3 wave 19, lost wave 21.
+    -- A "too close" rejection never deletes a spot permanently: anchors are
+    -- only treated as full temporarily by the existing ANCHOR_FULL_TTL logic.
+    local function currentWave()
+        local m = matchObj()
+        return (m and tonumber(m:GetAttribute("Wave"))) or 0
+    end
+    -- returns the lowest Void level (nil if none owned) and how many Voids are maxed
+    local function voidLevels()
+        local minLvl, maxed = nil, 0
+        for _, d in ipairs(getMyDragons()) do
+            if nameOf(d) == "Void" then
+                local lvl, pos = levelOf(d), dragonPos(d)
+                if lvl and pos then
+                    if dragonMaxed[spotKey(pos)] then lvl = maxLevelFor("Void") end
+                    if minLvl == nil or lvl < minLvl then minLvl = lvl end
+                    if lvl >= maxLevelFor("Void") then maxed = maxed + 1 end
+                end
+            end
+        end
+        return minLvl, maxed
+    end
+    -- true once Void may take another dragon: fewer than 2 owned, or the
+    -- lowest existing Void is maxed (L9). After wave 30 the bar drops to L7
+    -- so a match cannot stall forever if cash cannot finish L9.
+    local function kubleeVoidPlaceOpen(owned)
+        if (owned["Void"] or 0) < 2 then return true end
+        local minLvl = voidLevels()
+        if minLvl == nil then return true end
+        local need = currentWave() >= 30 and 7 or 9
+        return minLvl >= need
+    end
+
     -- Prism/Titan open when Void or Minigun has GATE_MIN_PLACED placed. Also open when the base types are not listed or
     -- have nothing left to do, so a capped or finished base type does not stall everything.
     local function gateOpen(owned)
@@ -937,10 +1002,19 @@ local function createEngine(userCfg, ctx)
 
     local function eligibleTypes(owned)
         local open = gateOpen(owned)
+        -- [Build 4 — Kublee555] Minigun / Prism / Titan wait until Void has 2
+        -- maxed (L9) Voids. Unlocked if Void is not listed at all, or Void has
+        -- no work left (maxed / capped / off), so a Void-less account never stalls.
+        local voidListed = false
+        for _, n in ipairs(listedTypes()) do if n == "Void" then voidListed = true break end end
+        local _, voidMaxed = voidLevels()
+        local voidGateOpen = (not voidListed) or (voidMaxed >= 2) or (not typeHasWork("Void", owned))
         local out = {}
         for _, n in ipairs(listedTypes()) do
             local gated = table.find(CONFIG.BASE_TYPES, n) == nil
-            if (open or not gated) and typeHasWork(n, owned) then out[#out + 1] = n end
+            if n ~= "Void" and not voidGateOpen then
+                -- Kublee555: Void first, other types wait for 2 maxed Voids.
+            elseif (open or not gated) and typeHasWork(n, owned) then out[#out + 1] = n end
         end
         return out
     end
@@ -987,6 +1061,7 @@ local function createEngine(userCfg, ctx)
     local function buildAction(kind, name, owned)
         if kind == "P" then
             if not typeRoom(name, owned, CONFIG.MAX_PER_TYPE) or not totalRoom() then return nil end
+            if name == "Void" and not kubleeVoidPlaceOpen(owned) then return nil end -- [Build 4 — Kublee555] no 3rd Void until the first 2 are L9 (L7 after wave 30); the place step is skipped and the scheduler falls through to an upgrade instead
             if (noSpotUntil[name] or 0) > os.clock() then return nil end
             return { kind = "P", name = name, price = price(name, 1) }
         end
@@ -1567,8 +1642,31 @@ local function _telLog(_source, _action, _detail)
   _TEL.Events[#_TEL.Events + 1] = _detail
   if #_TEL.Events > _TELEMETRY_MAX_EVENTS then table.remove(_TEL.Events, 1) _TEL.Truncated = true end
 end
+-- [Build 4] Win/lose + duration in minutes, on EVERY ending record (win and
+-- lose alike). duration is in seconds; e.g. the losing example is 339s =
+-- 5.65 menit (5m 39s), and a Kublee555-style win runs to wave 55.
+local function _telEndFields()
+  local _r = _bnjqe_jhyy.Result
+  local _won = nil
+  if type(_r) == "table" then _won = _r.Won end -- keep false as false (Won=false must read LOSE, not UNKNOWN)
+  local _text = (_won == true and "WIN") or (_won == false and "LOSE") or "UNKNOWN"
+  local _dur = (_TEL.StartedAt and math.floor(os.clock() - _TEL.StartedAt)) or (type(_r) == "table" and tonumber(_r.Duration)) or nil
+  local _min = (_dur ~= nil) and (math.floor(_dur / 60 * 100 + 0.5) / 100) or nil
+  local _minText = nil
+  if _dur ~= nil then _minText = string.format("%.2f menit (%dm %02ds)", _dur / 60, math.floor(_dur / 60), _dur % 60) end
+  return _text, _dur, _min, _minText
+end
 local function _telPayload()
-  return {schema = "dragontd-telemetry", version = _TELEMETRY_VERSION, account = _telAccount(), map = _TEL.Map, round = _TEL.Round, match = _TEL.MatchToken, startedAt = _TEL.StartedTime, endedAt = os.time(), duration = (_TEL.StartedAt and math.floor(os.clock() - _TEL.StartedAt)) or nil, result = _bnjqe_jhyy.Result or nil, truncated = _TEL.Truncated or false, sentParts = _TEL.SentParts, events = _TEL.Events, farmLog = _TEL.FarmLines}
+  local _text, _dur, _min, _minText = _telEndFields()
+  local _res = nil
+  if type(_bnjqe_jhyy.Result) == "table" then
+    _res = {}
+    for _k, _v in pairs(_bnjqe_jhyy.Result) do _res[_k] = _v end
+    _res.resultText = _text
+    _res.durationMinutes = _min
+    _res.durationMinutesText = _minText
+  end
+  return {schema = "dragontd-telemetry", version = _TELEMETRY_VERSION, account = _telAccount(), map = _TEL.Map, round = _TEL.Round, match = _TEL.MatchToken, startedAt = _TEL.StartedTime, endedAt = os.time(), duration = _dur, resultText = _text, durationMinutes = _min, durationMinutesText = _minText, result = _res, truncated = _TEL.Truncated or false, sentParts = _TEL.SentParts, events = _TEL.Events, farmLog = _TEL.FarmLines}
 end
 local function _telSave()
   if type(writefile) ~= "function" then return false end
@@ -1628,10 +1726,11 @@ local function _telSend()
   local _acc = _telAccount()
   local _fname = "Telemetry_" .. tostring(_acc.userId or 0) .. "_" .. tostring(os.time()) .. ".json"
   if type(_TEL.LastFile) == "string" and _TEL.LastFile ~= "" then local _b = _TEL.LastFile:match("([^/\\]+)$") if _b and _b ~= "" then _fname = _b end end
+  local _text, _dur, _min, _minText = _telEndFields() -- [Build 4] WIN/LOSE + minutes in the Discord summary too
   local _r = _bnjqe_jhyy.Result or {}
-  local _resText = "match ended"
-  if _r.Won == true then _resText = "Won" elseif _r.Won == false then _resText = "Lost" end
-  if _r.Wave ~= nil then _resText = _resText .. " W" .. tostring(_r.Wave) end
+  local _resText = _text
+  if _r.Wave ~= nil then _resText = _resText .. " — Wave " .. tostring(_r.Wave) end
+  if _minText ~= nil then _resText = _resText .. " — " .. _minText end
   local _summary = "[telemetry] " .. _acc.username .. " (" .. tostring(_acc.userId) .. ") match " .. tostring(_TEL.MatchToken) .. " — " .. tostring(_TEL.Map or "?") .. " — " .. _resText .. " — " .. tostring(#_TEL.Events) .. " events, " .. tostring(#_json) .. " bytes" .. (_TEL.Truncated and " (truncated)" or "")
   local _okCall, _okFile, _info = _l1l1lI1Il(_telPostFile, _fname, _json, _summary)
   if _okCall and _okFile then
@@ -1670,7 +1769,8 @@ local function _telStop(_reason)
   if not _TEL.Active or _TEL.Finalized then return end
   _TEL.Finalized = true
   _TEL.Active = false
-  _telLog("hub", "match_end", {reason = _reason, cashBefore = _telCash()})
+  local _text, _dur, _min, _minText = _telEndFields() -- [Build 4] WIN/LOSE + minutes on the match_end event too
+  _telLog("hub", "match_end", {reason = _reason, cashBefore = _telCash(), resultText = _text, duration = _dur, durationMinutes = _min, durationMinutesText = _minText})
   _l1l1lI1Il(_telSave)
   task.spawn(function() _l1l1lI1Il(_telSend) end)
 end
