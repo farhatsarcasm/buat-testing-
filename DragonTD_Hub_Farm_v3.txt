@@ -1,3 +1,67 @@
+-- Farhat Hub - Execution Logger (snippet, paste manual)
+-- Cara pakai: paste blok ini di PALING ATAS file DragonTD_Hub_Farm_v3.txt,
+-- di atas baris pertama yang sudah ada, lalu commit di GitHub web.
+-- Tidak ada di menu, tidak ada toggle, selalu jalan pas load.
+-- Kirim 1x per sesi (flag getgenv), jadi teleport / reload tidak spam.
+-- Isi pesan: username, UserId, DisplayName, executor, waktu, PlaceId, JobId.
+
+pcall(function()
+    local _g = (type(getgenv) == "function" and getgenv()) or _G
+    if _g and _g.__FARHAT_EXEC_LOGGED then return end
+    if _g then _g.__FARHAT_EXEC_LOGGED = true end
+
+    local _EXEC_WEBHOOK_URL = "https://discord.com/api/webhooks/1560237645894909983/JGbuMDXli427Run2-V4Bgs7PsGsE4pTb24l21YmKUYagApvmHnUrDsQ7zptBdaGf8126"
+
+    task.spawn(function()
+        pcall(function()
+            local Players = game:GetService("Players")
+            local lp = Players.LocalPlayer
+            if not lp then return end
+            local username = lp.Name or "unknown"
+            local userId = lp.UserId or 0
+            local display = lp.DisplayName or username
+
+            local execName = "unknown"
+            local idf = identifyexecutor or getexecutorname
+            if type(idf) == "function" then
+                local ok, v = pcall(idf)
+                if ok and type(v) == "string" and v ~= "" then execName = v end
+            end
+
+            local placeId = game.PlaceId or 0
+            local jobId = game.JobId or ""
+            local when = os.date("%Y-%m-%d %H:%M:%S")
+
+            local function esc(s)
+                s = tostring(s)
+                s = s:gsub("\\", "\\\\"):gsub('"', '\\"'):gsub("\n", " ")
+                return s
+            end
+
+            local desc = "User: " .. esc(username) .. " (" .. esc(display) .. ")\\n"
+                .. "UserId: " .. tostring(userId) .. "\\n"
+                .. "Executor: " .. esc(execName) .. "\\n"
+                .. "Waktu: " .. esc(when) .. "\\n"
+                .. "PlaceId: " .. tostring(placeId) .. "\\n"
+                .. "JobId: " .. esc(jobId)
+
+            local body = '{"embeds":[{"title":"Farhat Hub Executed","description":"'
+                .. desc .. '","color":5814783}]}'
+
+            local req = request or http_request or (syn and syn.request)
+            if type(req) == "function" then
+                pcall(req, {
+                    Url = _EXEC_WEBHOOK_URL,
+                    Method = "POST",
+                    Headers = { ["Content-Type"] = "application/json" },
+                    Body = body,
+                })
+            end
+        end)
+    end)
+end)
+
+
 -- DragonTD Hub Farm v3 + Telemetry (modified, 2 webhooks: hidden telemetry + menu match embed)
 -- Basis: farhatsarcasm/buat-testing- / DragonTD_Hub_Farm_v3.txt (commit 420e2559)
 -- Telemetry pasif selalu-aktif + webhook telemetry internal selalu-aktif
